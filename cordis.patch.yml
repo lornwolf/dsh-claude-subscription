@@ -1,0 +1,6 @@
+# Claude Pro/Max subscription route: one plugin owns the provider, the native
+# Claude Code OAuth login, the account vault and the identity shim that keeps
+# subscription traffic indistinguishable from the official CLI.
+- insert:
+    - id: claude-subscription
+      name: 'dsh-claude-subscription'
