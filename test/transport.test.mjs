@@ -6,6 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createSubscriptionProvider, CLAUDE_CODE_IDENTITY } from "../lib/fingerprint.js";
 import { materializeContext } from "../lib/context.js";
+import { mapCatalog } from "../lib/catalog.js";
 
 // Only this explicit fake credential is used; no account store/auth resolution is invoked.
 const TOKEN = "sk-ant-oat01-offline-only";
@@ -233,6 +234,26 @@ test("real pi-ai SDK → subscription wrapper → offline fetch", { timeout: 300
     const result = await collect(() => provider.stream(model, context(), { ...options(fake), apiKey: "sk-ant-api03-offline-only" }));
     assert.equal(fake.requests.length, 0, "subscription wrapper must reject ordinary API-key credentials before fetch");
     failure(result);
+  });
+
+  await t.test("discovered adaptive Claude models retain off:null and never send thinking.type:disabled", async () => {
+    const known = base.getModels().find(entry => entry.compat?.forceAdaptiveThinking && entry.thinkingLevelMap?.off === null);
+    assert.ok(known, "SDK must supply an adaptive Claude with omitted-thinking semantics");
+    const rows = [known.id, "claude-regression-5"].map(id => ({ id, max_input_tokens: 1000000, max_tokens: 128000,
+      capabilities: { thinking: { supported: true, types: { adaptive: { supported: true }, enabled: { supported: false } } },
+        effort: { supported: true, low: { supported: true }, high: { supported: true }, max: { supported: true } } } }));
+    const discovered = mapCatalog(rows, base.getModels());
+    const wrapped = createSubscriptionProvider({ ...base, getModels: () => discovered }, () => ({}));
+    for (const entry of wrapped.getModels()) {
+      assert.equal(entry.thinkingLevelMap.off, null);
+      for (const reasoning of ["off", "low", "high"]) {
+        const fake = transport(body => body.thinking?.type === "disabled"
+          ? Response.json({ error: { type: "invalid_request_error", message: "thinking.type.disabled is not supported" } }, { status: 400 })
+          : sse(body.model));
+        success(await collect(() => wrapped.streamSimple(entry, context(), { ...options(fake), reasoning })));
+        assert.notEqual(fake.requests[0].body.thinking?.type, "disabled");
+      }
+    }
   });
 
   await t.test("subscription credential is blocked for nonofficial endpoint before transport", async () => {

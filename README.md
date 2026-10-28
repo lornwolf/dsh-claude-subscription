@@ -17,10 +17,18 @@
 ## 安装
 
 ```sh
-dsh plugin --profile desktop add file:./vendor/dsh-claude-subscription-0.1.4.tgz
+dsh plugin --profile desktop add file:./vendor/dsh-claude-subscription-0.2.1.tgz
 ```
 
 或在 profile 的 `package.json` 里加依赖与 bundle 后重启宿主。
+
+预构建安装包也会随 [GitHub Release](https://github.com/lornwolf/dsh-claude-subscription/releases) 发布。Web profile 可直接安装固定版本的发布资产：
+
+```sh
+dsh plugin --profile web add https://github.com/lornwolf/dsh-claude-subscription/releases/download/v0.2.1/dsh-claude-subscription-0.2.1.tgz
+```
+
+桌面版请使用应用自带的插件管理入口；部分全局 `dsh` CLI 会拒绝操作 `desktop` 保留配置。更新后完全退出并重新打开 DSH。
 
 ## Claude 5 及以上：精简系统提示
 
@@ -47,7 +55,7 @@ dsh plugin --profile desktop add file:./vendor/dsh-claude-subscription-0.1.4.tgz
 
 `lib/client.js` 往设置面板的 `settings.section` 槽注册一个分区：登录按钮、授权链接与授权码输入、账号列表（切换/移除）、额度、模型清单、当前指纹。浏览器只拿到状态与授权链接，凭据与网络请求都留在宿主进程。
 
-宿主侧由 `lib/rpc.js` 在 `connection.fetch` 上挂 `/api/claude-subscription/*` 八个端点（status / login / login/submit / login/cancel / logout / quota / accounts/select / accounts/remove），信封走 DSH 既有的 `{rpcId, method, payload}` → `{type: "server-response", rpcId, result}`。
+宿主侧由 `lib/rpc.js` 在 `connection.fetch` 上挂 `/api/claude-subscription/*` 十个端点（status / login / login/submit / login/cancel / logout / quota / accounts/select / accounts/remove / models/refresh / routing/set），信封走 DSH 既有的 `{rpcId, method, payload}` → `{type: "server-response", rpcId, result}`。
 
 > 需要 `ui-settings` 处于启用状态才有设置面板可挂；有的部署把它关掉了，那时用下面的工具同样能完成登录。
 
@@ -81,12 +89,43 @@ dsh plugin --profile desktop add file:./vendor/dsh-claude-subscription-0.1.4.tgz
   name: 'dsh-claude-subscription'
   config:
     displayName: Claude 订阅
+    autoSwitch: off              # off / priority / quota-aware；省略时使用设置页保存的选择
+    catalogRefresh: true         # 启动、登录/切换账号后和每小时后台刷新目录
     identity:
       userAgent: claude-cli/2.1.280 (external, cli)
       appHeader: cli
       dropBrowserHeaders: true
       dropSdkHeaders: false      # 打开后连 x-stainless-* 也删
       metadataUserId: null       # 填字符串则带上 metadata.user_id
+```
+
+## 0.2.1 修复在线目录的思考参数回归
+
+0.2.0 用在线 effort 档位替换 `thinkingLevelMap` 时丢失了 SDK 的 `off: null` 协议标记，导致 Claude 5+ 在关闭思考时发送不支持的 `thinking: { type: "disabled" }`，收到 HTTP 400 / `INVALID_REQUEST`。现在保留已知模型的 off 映射，并为仅支持 adaptive thinking 的模型设置 `off: null`。现有磁盘目录缓存重新读取时也会自动修复，无需删除缓存或重新登录。新增真实 SDK 出站测试，覆盖已知/新发现模型及 off、low、high 三种档位。
+
+## 0.2.0 额度、模型目录与账号路由
+
+- **额度格式**：兼容 `five_hour` / `seven_day*` 及 `limits[]`，保留模型范围、重置时间和超过 100% 的已用值；数组有效时优先使用，否则回退旧字段。
+- **共享额度缓存**：设置页、会话入口与工具共用按账号隔离的 5 分钟缓存；同账号并发查询合并。过期可先显示旧值并后台更新，失败仍显示上次成功值和更新时间。429 遵守 `Retry-After`，手动查询也不绕过冷却；没有该头时失败冷却 1 分钟。不发送额外推理请求探测额度。
+- **模型目录**：登录后及后台每小时读取官方 `/v1/models`，支持分页。按账号缓存到 `~/.dsh/state/claude-subscription/catalogs/`（或 `DSH_HOME` 下），重启和网络故障时继续使用上次成功结果；没有结果时用 pi-ai 内置目录。设置页可手动刷新，输入/输出上限与 thinking/effort 能力随发现结果更新。SDK 未收录的新模型复用 Messages 协议；缺失能力信息时采用保守限制和文本输入，需要实际接口支持才能使用。
+- **授权续期**：提前 5 分钟刷新，保存真实到期时间。临时错误按冷却时间重试；400/401/403 或无效令牌响应会暂停自动续期并提示重新登录。旧 access token 未到期时继续使用。切换账号不会清除续期失败状态，新凭据会使旧状态失效。
+- **进程间协调**：用 `@deepseek-ai/dsh-atomic-write` 的文件锁覆盖账号库整个读改写/续期事务；刷新期间发现凭据已被外部替换，保留新凭据。锁等待最多 45 秒，取消的等待者不会执行修改。异常退出可能遗留 `accounts.lock`；只有确认所有使用该账号库的 DSH 进程都已停止，才可移除遗留锁，插件不会按文件年龄强行解锁。
+- **会话额度入口**：支持 `conversation.composer.dock` 和 `modelDirectories` 的宿主会在 Claude 会话输入框附近显示剩余额度；点击可看账号、重置时间和数据更新时间。故障转移后显示该会话实际使用的账号，切到其他提供商时隐藏。挂载期间每 15 秒检查会话状态，额度网络请求仍受共享缓存限制。
+- **可选自动切换**：设置页提供关闭、故障时切换、按额度选择三种策略，选择保存在 `routing.json`，重启后生效。配置中的 `autoSwitch` 指定初始策略；显式 `false` 或 `off` 表示关闭。按额度选择会避开已用 ≥95% 的有效窗口，优先使用临近重置且有剩余额度的账号；已建立的会话尽量固定账号。不会改变手动选择的默认账号。只有尚未输出任何内容时，才对认证、限流或临时服务故障尝试其他账号；请求取消、参数错误和上下文超限不切换。自动切换开启时模型选择器合并各账号目录。历史回放元数据绑定账号与模型，换账号时降级为普通历史；运行中的请求使用独立凭据快照。
+
+会话账号绑定和故障冷却仅存内存，重启后重新选择账号。现有凭据格式无需迁移；旧版保存的保守到期时间可能触发一次提前续期。新增功能已通过离线测试，真实订阅的模型可用性和额度字段仍以服务端为准。
+
+验证命令：
+
+```powershell
+npm install --ignore-scripts --legacy-peer-deps
+npm test
+# 以下路径指向独立测试依赖，不修改运行中的 DSH：
+$env:PI_AI_PACKAGE_ROOT = '<测试依赖目录>/node_modules/@earendil-works/pi-ai'
+npm test
+$env:DSH_TEST_HOST_ROOT = '<测试依赖目录>'
+node --loader ./test/host-loader.mjs ./test/plugin-smoke.mjs
+npm pack
 ```
 
 ## 0.1.4 设置页额度 RPC 修复

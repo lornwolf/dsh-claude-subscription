@@ -76,7 +76,7 @@ function browserInteraction(controller, manual = forever) {
     assert.notEqual(body.state, body.code_verifier);
     assert.equal(interaction.auth.searchParams.get("code_challenge"), createHash("sha256").update(body.code_verifier).digest("base64url"));
     assert.equal(interaction.auth.searchParams.get("code_challenge_method"), "S256");
-    assert.ok(credential.expires >= before + 3300000 && credential.expires <= Date.now() + 3300000);
+    assert.ok(credential.expires >= before + 3600000 && credential.expires <= Date.now() + 3600000);
     assert.deepEqual(await oauth.toAuth(credential), { apiKey: tokens().access_token });
   }
   assert.notEqual(captured[0].body.state, captured[1].body.state);

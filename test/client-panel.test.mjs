@@ -7,10 +7,12 @@ const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'
 
 // Exercise the shipped single-file loader, slot registration, hooks and native
 // elements without installing React or changing the local DSH installation.
-function harness(language = 'zh') {
+function harness(language = 'zh', slot = 'settings.section') {
   let cursor = 0;
   const hooks = [];
   const effects = [];
+  const timers = new Map();
+  let nextTimer = 0, currentModel = { provider: 'anthropic', model: 'claude-offline-6' };
   const same = (a, b) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
   const React = {
     createElement(type, props, ...children) { return { type, props: { ...props, children } }; },
@@ -35,7 +37,7 @@ function harness(language = 'zh') {
     }
   };
   let factory;
-  vm.runInNewContext(source, { window: { __ModuleLoader__: { load: (value) => { factory = value.factory; } } }, Intl, Date, navigator: {} });
+  vm.runInNewContext(source, { window: { __ModuleLoader__: { load: (value) => { factory = value.factory; } } }, Intl, Date, navigator: {}, setInterval: fn => { timers.set(++nextTimer, fn); return nextTimer; }, clearInterval: id => timers.delete(id) });
   const exports = factory((id) => { assert.equal(id, 'react'); return React; });
   const pending = [];
   const rpc = { call(_api, endpoint, payload) {
@@ -44,8 +46,8 @@ function harness(language = 'zh') {
   let section, props, dictionary;
   exports.apply({
     locale: { bind: () => (key) => dictionary[key] ?? key, register: (_namespace, dictionaries) => { dictionary = dictionaries[language]; } },
-    effect: (fn) => fn(), get: () => ({ rpc }),
-    slots: { inject: (_slot, fn) => fn(), register: (metadata, component) => { section = component; props = metadata.inject(); } }
+    effect: (fn) => fn(), get: name => name === 'modelDirectories' ? { directoryFor: () => ({ load: async () => ({ current: currentModel }) }) } : ({ rpc }),
+    slots: { inject: (_slot, fn) => fn(), register: (metadata, component) => { if (metadata.name === slot) { section = component; props = metadata.inject('offline-session'); } } }
   });
   const expand = (node) => {
     if (node == null || typeof node === 'boolean') return null;
@@ -67,7 +69,7 @@ function harness(language = 'zh') {
     return pending.splice(index, 1)[0];
   };
   const respond = async (req, value) => { req.resolve({ ok: true, value }); await tick(); };
-  return { render, pure, request, respond, pending };
+  return { render, pure, request, respond, pending, poll: () => timers.forEach(fn => { void fn(); }), setModel: model => { currentModel = model; } };
 }
 
 const tick = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
@@ -221,4 +223,44 @@ test('active removal and logout clear quota before RPC completion and ignore lat
     await h.respond(h.request('status'), { signedIn: false, accounts: [] });
     assert.doesNotMatch(text(h.render()), /66%/);
   }
+});
+
+test('settings refresh model catalog, persist routing choice and show stale quota/refresh warnings', async () => {
+  const h = await mounted();
+  button(h.render(), '刷新模型目录')();
+  await h.respond(h.request('models/refresh'), { accountId: accounts[0].id, models: [{ id: 'claude-new-6', name: 'New Claude' }], fetchedAt: '2030-01-01T00:00:00Z' });
+  assert.match(text(h.render()), /New Claude/);
+  const select = nodes(h.render()).find(node => node.type === 'select');
+  select.props.onChange({ target: { value: 'priority' } });
+  const req = h.request('routing/set'); assert.equal(req.payload.mode, 'priority');
+  await h.respond(req, { mode: 'priority' });
+  assert.equal(nodes(h.render()).find(node => node.type === 'select').props.value, 'priority');
+  button(h.render(), '查询额度')();
+  const read = h.request('quota'); assert.equal(read.payload.force, true);
+  await h.respond(read, { ...quota(), stale: true });
+  assert.match(text(h.render()), /上次成功的数据/);
+  button(h.render(), '刷新')();
+  await h.respond(h.request('status'), { ...status(), refreshState: { warning: '请重新登录测试账号', loginRequired: true } });
+  assert.match(text(h.render()), /请重新登录测试账号/);
+});
+
+test('composer badge shows the serving account, freshness and model-scoped windows; hides on other routes', async () => {
+  const h = harness('zh', 'conversation.composer.dock');
+  h.render(); await tick();
+  const req = h.request('quota'); assert.equal(req.payload.sessionId, 'offline-session'); assert.equal(req.payload.model, 'claude-offline-6');
+  await h.respond(req, { ...quota(), accountName: 'Bob', defaultAccount: false, fetchedAt: '2030-01-01T00:00:00Z', stale: true,
+    windows: [{ window: 'five_hour', scope: 'Opus', utilization: 34, remainingPercent: 66 }] });
+  const tree = h.render(); assert.match(text(tree), /Claude 额度.*66%/);
+  nodes(tree).find(node => node.type === 'button').props.onClick();
+  assert.match(text(h.render()), /本会话实际账号: Bob/);
+  assert.match(text(h.render()), /Opus/); assert.match(text(h.render()), /更新于/);
+  h.setModel({ provider: 'other', model: 'other-model' }); h.poll(); await tick();
+  assert.equal(h.render(), null); assert.equal(h.pending.length, 0);
+});
+
+test('composer discards a late quota response when the selected model changes', async () => {
+  const h = harness('zh', 'conversation.composer.dock');
+  h.render(); await tick(); const req = h.request('quota');
+  h.setModel({ provider: 'other', model: 'other-model' });
+  await h.respond(req, quota()); assert.equal(h.render(), null);
 });
